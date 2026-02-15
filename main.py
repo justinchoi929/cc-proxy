@@ -413,6 +413,11 @@ def convert_error(status_code: int, openai_error: dict) -> tuple[int, dict]:
 app = FastAPI(title="cc-proxy")
 
 
+@app.get("/")
+async def health():
+    return {"status": "ok", "service": "cc-proxy"}
+
+
 async def handle_streaming(client: httpx.AsyncClient, openai_req: dict, model: str):
     """Handle streaming proxy: read OpenAI SSE -> convert -> emit Anthropic SSE."""
 
