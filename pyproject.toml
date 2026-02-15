@@ -1,0 +1,9 @@
+[project]
+name = "cc-proxy"
+version = "0.1.0"
+description = "Local proxy that translates Anthropic Messages API to OpenAI Chat Completions format"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
