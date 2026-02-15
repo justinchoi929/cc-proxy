@@ -1,5 +1,6 @@
 # main.py
 import json
+import logging
 import uuid
 from typing import Any
 
@@ -8,6 +9,13 @@ import yaml
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("cc-proxy")
 
 # --- Config ---
 
@@ -418,6 +426,60 @@ async def health():
     return {"status": "ok", "service": "cc-proxy"}
 
 
+@app.get("/v1/models")
+async def list_models():
+    """Return a minimal model list so Claude Code's model check passes."""
+    return {"object": "list", "data": []}
+
+
+@app.get("/v1/models/{model_id:path}")
+async def get_model(model_id: str):
+    """Return a minimal model object for any model ID requested."""
+    logger.info(f"-> model check: {model_id}")
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": 0,
+        "owned_by": "proxy",
+    }
+
+
+@app.post("/v1/messages/count_tokens")
+async def count_tokens(request: Request):
+    """Estimate token count from request body (rough char/4 approximation)."""
+    body = await request.json()
+
+    total_chars = 0
+    # Count system prompt
+    system = body.get("system")
+    if isinstance(system, str):
+        total_chars += len(system)
+    elif isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and block.get("type") == "text":
+                total_chars += len(block.get("text", ""))
+
+    # Count messages
+    for msg in body.get("messages", []):
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    total_chars += len(block.get("text", ""))
+                    total_chars += len(block.get("content", "") if isinstance(block.get("content"), str) else "")
+                    total_chars += len(json.dumps(block.get("input", "")) if block.get("input") else "")
+
+    # Count tools definitions
+    for tool in body.get("tools", []):
+        total_chars += len(json.dumps(tool))
+
+    input_tokens = max(1, total_chars // 4)
+    logger.info(f"-> count_tokens ~{input_tokens} (from {total_chars} chars)")
+    return {"input_tokens": input_tokens}
+
+
 async def handle_streaming(openai_req: dict, model: str):
     """Handle streaming proxy: read OpenAI SSE -> convert -> emit Anthropic SSE."""
 
@@ -442,6 +504,7 @@ async def handle_streaming(openai_req: dict, model: str):
                     error_text = ""
                     async for chunk in resp.aiter_text():
                         error_text += chunk
+                    logger.warning(f"<- upstream stream error {resp.status_code}: {error_text[:500]}")
                     try:
                         error_body = json.loads(error_text)
                     except Exception:
@@ -556,6 +619,7 @@ async def handle_non_streaming(openai_req: dict, model: str):
             "/v1/chat/completions", json=openai_req, headers=get_upstream_headers()
         )
         if resp.status_code != 200:
+            logger.warning(f"<- upstream {resp.status_code}: {resp.text[:500]}")
             try:
                 error_body = resp.json()
             except Exception:
@@ -564,6 +628,7 @@ async def handle_non_streaming(openai_req: dict, model: str):
             return JSONResponse(status_code=status, content=body)
         openai_resp = resp.json()
         anthropic_resp = convert_response(openai_resp, model=model)
+        logger.info(f"<- 200 model={model} stop={anthropic_resp.get('stop_reason')}")
         return JSONResponse(content=anthropic_resp)
 
 
@@ -574,21 +639,35 @@ async def messages_endpoint(request: Request):
     is_stream = body.get("stream", False)
     openai_req = convert_request(body)
 
+    logger.info(f"-> model={model} stream={is_stream} messages={len(body.get('messages', []))}")
+
     try:
         if is_stream:
             return await handle_streaming(openai_req, model)
         else:
             return await handle_non_streaming(openai_req, model)
-    except httpx.ConnectError:
+    except httpx.ConnectError as e:
+        logger.error(f"Connect error: {e}")
         return JSONResponse(status_code=529, content={
             "type": "error",
             "error": {"type": "overloaded_error", "message": "Failed to connect to upstream"},
         })
-    except httpx.TimeoutException:
+    except httpx.TimeoutException as e:
+        logger.error(f"Timeout: {e}")
         return JSONResponse(status_code=529, content={
             "type": "error",
             "error": {"type": "overloaded_error", "message": "Upstream request timed out"},
         })
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def catch_all(request: Request, path: str):
+    """Log any unhandled requests so we can see what Claude Code is calling."""
+    logger.warning(f"-> unhandled {request.method} /{path}")
+    return JSONResponse(status_code=404, content={
+        "type": "error",
+        "error": {"type": "not_found_error", "message": f"Endpoint /{path} not found"},
+    })
 
 
 def run():
