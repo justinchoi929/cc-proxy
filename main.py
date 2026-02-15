@@ -310,6 +310,70 @@ def convert_response(openai_resp: dict, model: str) -> dict:
     }
 
 
+# --- Streaming Event Builders ---
+
+def sse_event(event_type: str, data: dict) -> str:
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+def build_message_start_event(model: str, msg_id: str | None = None) -> str:
+    return sse_event("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": msg_id or generate_msg_id(),
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": model,
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        },
+    })
+
+def build_content_block_start_event(index: int, block_type: str, tool_id: str | None = None, tool_name: str | None = None) -> str:
+    if block_type == "text":
+        block = {"type": "text", "text": ""}
+    elif block_type == "thinking":
+        block = {"type": "thinking", "thinking": ""}
+    elif block_type == "tool_use":
+        block = {"type": "tool_use", "id": tool_id or "", "name": tool_name or "", "input": {}}
+    else:
+        block = {"type": block_type}
+    return sse_event("content_block_start", {
+        "type": "content_block_start",
+        "index": index,
+        "content_block": block,
+    })
+
+def build_content_block_delta_event(index: int, delta_type: str, text: str = "", partial_json: str = "") -> str:
+    if delta_type == "text_delta":
+        delta = {"type": "text_delta", "text": text}
+    elif delta_type == "thinking_delta":
+        delta = {"type": "thinking_delta", "thinking": text}
+    elif delta_type == "input_json_delta":
+        delta = {"type": "input_json_delta", "partial_json": partial_json}
+    else:
+        delta = {"type": delta_type}
+    return sse_event("content_block_delta", {
+        "type": "content_block_delta",
+        "index": index,
+        "delta": delta,
+    })
+
+def build_content_block_stop_event(index: int) -> str:
+    return sse_event("content_block_stop", {"type": "content_block_stop", "index": index})
+
+def build_message_delta_event(stop_reason: str, output_tokens: int = 0) -> str:
+    return sse_event("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "usage": {"output_tokens": output_tokens},
+    })
+
+def build_message_stop_event() -> str:
+    return sse_event("message_stop", {"type": "message_stop"})
+
+
 # --- Proxy Helpers ---
 
 def get_http_client() -> httpx.AsyncClient:
@@ -350,10 +414,134 @@ app = FastAPI(title="cc-proxy")
 
 
 async def handle_streaming(client: httpx.AsyncClient, openai_req: dict, model: str):
-    return JSONResponse(status_code=501, content={
-        "type": "error",
-        "error": {"type": "api_error", "message": "Streaming not yet implemented"},
-    })
+    """Handle streaming proxy: read OpenAI SSE -> convert -> emit Anthropic SSE."""
+
+    async def stream_generator():
+        msg_id = generate_msg_id()
+        yield build_message_start_event(model=model, msg_id=msg_id)
+
+        block_index = 0
+        current_block_type = None  # "text" | "thinking" | "tool_use"
+        tool_call_states: dict[int, dict] = {}  # OpenAI tool call index -> state
+        finish_reason = "end_turn"
+        output_tokens = 0
+
+        async with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json=openai_req,
+            headers=get_upstream_headers(),
+        ) as resp:
+            if resp.status_code != 200:
+                error_text = ""
+                async for chunk in resp.aiter_text():
+                    error_text += chunk
+                try:
+                    error_body = json.loads(error_text)
+                except Exception:
+                    error_body = {"error": {"message": error_text, "type": "api_error"}}
+                _, err = convert_error(resp.status_code, error_body)
+                yield sse_event("error", err)
+                return
+
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:].strip()
+                if data_str == "[DONE]":
+                    break
+
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                choices = chunk.get("choices", [])
+                if not choices:
+                    usage = chunk.get("usage")
+                    if usage:
+                        output_tokens = usage.get("completion_tokens", 0)
+                    continue
+
+                choice = choices[0]
+                delta = choice.get("delta", {})
+                chunk_finish = choice.get("finish_reason")
+
+                if chunk_finish:
+                    finish_reason = FINISH_REASON_MAP.get(chunk_finish, "end_turn")
+
+                usage = chunk.get("usage")
+                if usage:
+                    output_tokens = usage.get("completion_tokens", 0)
+
+                # Handle reasoning_content (thinking)
+                reasoning = delta.get("reasoning_content")
+                if reasoning:
+                    if current_block_type != "thinking":
+                        if current_block_type is not None:
+                            yield build_content_block_stop_event(block_index)
+                            block_index += 1
+                        yield build_content_block_start_event(block_index, "thinking")
+                        current_block_type = "thinking"
+                    yield build_content_block_delta_event(block_index, "thinking_delta", text=reasoning)
+                    continue
+
+                # Handle text content
+                text_content = delta.get("content")
+                if text_content:
+                    if current_block_type != "text":
+                        if current_block_type is not None:
+                            yield build_content_block_stop_event(block_index)
+                            block_index += 1
+                        yield build_content_block_start_event(block_index, "text")
+                        current_block_type = "text"
+                    yield build_content_block_delta_event(block_index, "text_delta", text=text_content)
+                    continue
+
+                # Handle tool calls
+                tool_calls = delta.get("tool_calls")
+                if tool_calls:
+                    for tc in tool_calls:
+                        tc_index = tc.get("index", 0)
+                        if tc_index not in tool_call_states:
+                            if current_block_type is not None:
+                                yield build_content_block_stop_event(block_index)
+                                block_index += 1
+                            tc_id = tc.get("id", f"toolu_{uuid.uuid4().hex[:12]}")
+                            tc_name = tc.get("function", {}).get("name", "")
+                            tool_call_states[tc_index] = {
+                                "id": tc_id,
+                                "name": tc_name,
+                                "block_index": block_index,
+                            }
+                            yield build_content_block_start_event(
+                                block_index, "tool_use", tool_id=tc_id, tool_name=tc_name
+                            )
+                            current_block_type = "tool_use"
+
+                        args_delta = tc.get("function", {}).get("arguments", "")
+                        if args_delta:
+                            bi = tool_call_states[tc_index]["block_index"]
+                            yield build_content_block_delta_event(
+                                bi, "input_json_delta", partial_json=args_delta
+                            )
+
+        # Close the last content block
+        if current_block_type is not None:
+            yield build_content_block_stop_event(block_index)
+
+        yield build_message_delta_event(finish_reason, output_tokens)
+        yield build_message_stop_event()
+
+    return StreamingResponse(
+        stream_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 async def handle_non_streaming(client: httpx.AsyncClient, openai_req: dict, model: str):
