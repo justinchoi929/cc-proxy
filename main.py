@@ -244,7 +244,158 @@ def convert_request(anthropic_req: dict) -> dict:
     return openai_req
 
 
+# --- Response Conversion (OpenAI -> Anthropic) ---
+
+FINISH_REASON_MAP = {
+    "stop": "end_turn",
+    "length": "max_tokens",
+    "tool_calls": "tool_use",
+    "content_filter": "end_turn",
+}
+
+
+def generate_msg_id() -> str:
+    return f"msg_{uuid.uuid4().hex[:24]}"
+
+
+def convert_response(openai_resp: dict, model: str) -> dict:
+    """Convert OpenAI Chat Completions response to Anthropic Messages format."""
+    choice = openai_resp["choices"][0]
+    message = choice["message"]
+    finish_reason = choice.get("finish_reason", "stop")
+    usage = openai_resp.get("usage", {})
+
+    content = []
+
+    # Add reasoning/thinking block if present
+    reasoning = message.get("reasoning_content")
+    if reasoning:
+        content.append({"type": "thinking", "thinking": reasoning})
+
+    # Add text content
+    text = message.get("content")
+    if text:
+        content.append({"type": "text", "text": text})
+
+    # Add tool_use blocks
+    tool_calls = message.get("tool_calls", [])
+    for tc in tool_calls:
+        func = tc["function"]
+        try:
+            input_data = json.loads(func["arguments"])
+        except (json.JSONDecodeError, TypeError):
+            input_data = {}
+        content.append({
+            "type": "tool_use",
+            "id": tc["id"],
+            "name": func["name"],
+            "input": input_data,
+        })
+
+    if not content:
+        content.append({"type": "text", "text": ""})
+
+    return {
+        "id": generate_msg_id(),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": FINISH_REASON_MAP.get(finish_reason, "end_turn"),
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+        },
+    }
+
+
+# --- Proxy Helpers ---
+
+def get_http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        base_url=UPSTREAM["base_url"],
+        timeout=httpx.Timeout(UPSTREAM.get("timeout", 300)),
+    )
+
+
+def get_upstream_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {UPSTREAM['api_key']}",
+        "Content-Type": "application/json",
+    }
+
+
+def convert_error(status_code: int, openai_error: dict) -> tuple[int, dict]:
+    error_body = openai_error.get("error", {})
+    error_type = error_body.get("type", "api_error")
+    type_map = {
+        "invalid_request_error": "invalid_request_error",
+        "authentication_error": "authentication_error",
+        "rate_limit_error": "rate_limit_error",
+        "not_found_error": "not_found_error",
+    }
+    return status_code, {
+        "type": "error",
+        "error": {
+            "type": type_map.get(error_type, "api_error"),
+            "message": error_body.get("message", "Unknown error"),
+        },
+    }
+
+
+# --- FastAPI App & Endpoints ---
+
 app = FastAPI(title="cc-proxy")
+
+
+async def handle_streaming(client: httpx.AsyncClient, openai_req: dict, model: str):
+    return JSONResponse(status_code=501, content={
+        "type": "error",
+        "error": {"type": "api_error", "message": "Streaming not yet implemented"},
+    })
+
+
+async def handle_non_streaming(client: httpx.AsyncClient, openai_req: dict, model: str):
+    resp = await client.post(
+        "/v1/chat/completions", json=openai_req, headers=get_upstream_headers()
+    )
+    if resp.status_code != 200:
+        try:
+            error_body = resp.json()
+        except Exception:
+            error_body = {"error": {"message": resp.text, "type": "api_error"}}
+        status, body = convert_error(resp.status_code, error_body)
+        return JSONResponse(status_code=status, content=body)
+    openai_resp = resp.json()
+    anthropic_resp = convert_response(openai_resp, model=model)
+    return JSONResponse(content=anthropic_resp)
+
+
+@app.post("/v1/messages")
+async def messages_endpoint(request: Request):
+    body = await request.json()
+    model = body.get("model", "unknown")
+    is_stream = body.get("stream", False)
+    openai_req = convert_request(body)
+
+    try:
+        async with get_http_client() as client:
+            if is_stream:
+                return await handle_streaming(client, openai_req, model)
+            else:
+                return await handle_non_streaming(client, openai_req, model)
+    except httpx.ConnectError:
+        return JSONResponse(status_code=529, content={
+            "type": "error",
+            "error": {"type": "overloaded_error", "message": "Failed to connect to upstream"},
+        })
+    except httpx.TimeoutException:
+        return JSONResponse(status_code=529, content={
+            "type": "error",
+            "error": {"type": "overloaded_error", "message": "Upstream request timed out"},
+        })
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host=SERVER["host"], port=SERVER["port"])
