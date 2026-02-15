@@ -444,54 +444,6 @@ async def get_model(model_id: str):
     }
 
 
-@app.post("/v1/messages/count_tokens")
-async def count_tokens(request: Request):
-    """Count tokens by forwarding to upstream with max_tokens=1."""
-    body = await request.json()
-    openai_req = convert_request(body)
-    openai_req["max_tokens"] = 1
-    openai_req["stream"] = False
-    openai_req.pop("stream_options", None)
-
-    try:
-        async with get_http_client() as client:
-            resp = await client.post(
-                "/v1/chat/completions", json=openai_req, headers=get_upstream_headers()
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                input_tokens = data.get("usage", {}).get("prompt_tokens", 0)
-                logger.info(f"-> count_tokens = {input_tokens}")
-                return {"input_tokens": input_tokens}
-            else:
-                logger.warning(f"<- count_tokens upstream {resp.status_code}, falling back to estimate")
-    except Exception as e:
-        logger.warning(f"<- count_tokens error: {e}, falling back to estimate")
-
-    # Fallback: rough estimation
-    total_chars = 0
-    system = body.get("system")
-    if isinstance(system, str):
-        total_chars += len(system)
-    elif isinstance(system, list):
-        for block in system:
-            if isinstance(block, dict) and block.get("type") == "text":
-                total_chars += len(block.get("text", ""))
-    for msg in body.get("messages", []):
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            total_chars += len(content)
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict):
-                    total_chars += len(block.get("text", ""))
-    for tool in body.get("tools", []):
-        total_chars += len(json.dumps(tool))
-    input_tokens = max(1, total_chars // 4)
-    logger.info(f"-> count_tokens ~{input_tokens} (estimate)")
-    return {"input_tokens": input_tokens}
-
-
 async def handle_streaming(openai_req: dict, model: str):
     """Handle streaming proxy: read OpenAI SSE -> convert -> emit Anthropic SSE."""
 
