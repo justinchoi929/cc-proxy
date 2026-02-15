@@ -1,0 +1,8 @@
+services:
+  cc-proxy:
+    build: .
+    ports:
+      - "18081:18081"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    restart: unless-stopped

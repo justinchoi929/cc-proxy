@@ -24,8 +24,8 @@ class TestConvertBasicTextMessage:
 
         # model passes through
         assert result["model"] == "claude-sonnet-4-20250514"
-        # max_tokens fixed to 16384
-        assert result["max_tokens"] == 16384
+        # max_tokens passes through
+        assert result["max_tokens"] == 1024
         # temperature passes through
         assert result["temperature"] == 0.7
         # system becomes first message with role=system

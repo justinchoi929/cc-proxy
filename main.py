@@ -188,8 +188,9 @@ def convert_request(anthropic_req: dict) -> dict:
     # Model: pass through
     openai_req["model"] = anthropic_req["model"]
 
-    # max_tokens: fixed
-    openai_req["max_tokens"] = 16384
+    # max_tokens: pass through
+    if "max_tokens" in anthropic_req:
+        openai_req["max_tokens"] = anthropic_req["max_tokens"]
 
     # Build messages list
     converted_messages = []
@@ -589,5 +590,8 @@ async def messages_endpoint(request: Request):
         })
 
 
-if __name__ == "__main__":
+def run():
     uvicorn.run(app, host=SERVER["host"], port=SERVER["port"])
+
+if __name__ == "__main__":
+    run()
