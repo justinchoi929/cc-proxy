@@ -635,7 +635,7 @@ async def catch_all(request: Request, path: str):
 
 
 def run():
-    uvicorn.run(app, host=SERVER["host"], port=SERVER["port"])
+    uvicorn.run(app, host=SERVER["host"], port=SERVER["port"], access_log=False)
 
 if __name__ == "__main__":
     run()
