@@ -245,17 +245,6 @@ def convert_request(anthropic_req: dict) -> dict:
         if anthropic_req["stream"]:
             openai_req["stream_options"] = {"include_usage": True}
 
-    # thinking -> reasoning_effort
-    thinking = anthropic_req.get("thinking")
-    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
-        budget = thinking.get("budget_tokens", 0)
-        if budget <= 5000:
-            openai_req["reasoning_effort"] = "low"
-        elif budget <= 15000:
-            openai_req["reasoning_effort"] = "medium"
-        else:
-            openai_req["reasoning_effort"] = "high"
-
     # tools: convert if present
     if "tools" in anthropic_req:
         openai_req["tools"] = convert_tools(anthropic_req["tools"])
