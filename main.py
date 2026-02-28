@@ -1,4 +1,5 @@
 # main.py
+import asyncio
 import json
 import logging
 import uuid
@@ -26,6 +27,7 @@ def load_config(path: str = "config.yaml") -> dict:
 CONFIG = load_config()
 SERVER = CONFIG["server"]
 UPSTREAM = CONFIG["upstream"]
+MODEL_MAP = CONFIG.get("model_map", {})
 
 # --- Request Conversion (Anthropic -> OpenAI) ---
 
@@ -193,8 +195,9 @@ def convert_request(anthropic_req: dict) -> dict:
     """
     openai_req: dict[str, Any] = {}
 
-    # Model: pass through
-    openai_req["model"] = anthropic_req["model"]
+    # Model: map to upstream-supported names (from config.yaml)
+    raw_model = anthropic_req["model"]
+    openai_req["model"] = MODEL_MAP.get(raw_model, raw_model)
 
     # max_tokens: pass through
     if "max_tokens" in anthropic_req:
@@ -444,6 +447,9 @@ async def get_model(model_id: str):
     }
 
 
+STREAM_RETRY_STATUSES = {404, 429, 500, 502, 503, 529}
+MAX_STREAM_RETRIES = 3
+
 async def handle_streaming(openai_req: dict, model: str):
     """Handle streaming proxy: read OpenAI SSE -> convert -> emit Anthropic SSE."""
 
@@ -457,107 +463,127 @@ async def handle_streaming(openai_req: dict, model: str):
         finish_reason = "end_turn"
         output_tokens = 0
 
-        async with get_http_client() as client:
-            async with client.stream(
-                "POST",
-                "/v1/chat/completions",
-                json=openai_req,
-                headers=get_upstream_headers(),
-            ) as resp:
-                if resp.status_code != 200:
-                    error_text = ""
-                    async for chunk in resp.aiter_text():
-                        error_text += chunk
-                    logger.warning(f"<- upstream stream error {resp.status_code}: {error_text[:500]}")
-                    try:
-                        error_body = json.loads(error_text)
-                    except Exception:
-                        error_body = {"error": {"message": error_text, "type": "api_error"}}
-                    _, err = convert_error(resp.status_code, error_body)
-                    yield sse_event("error", err)
-                    return
+        # Retry loop for transient upstream errors
+        last_error = None
+        for attempt in range(MAX_STREAM_RETRIES):
+            async with get_http_client() as client:
+                async with client.stream(
+                    "POST",
+                    "/v1/chat/completions",
+                    json=openai_req,
+                    headers=get_upstream_headers(),
+                ) as resp:
+                    if resp.status_code != 200:
+                        error_text = ""
+                        async for chunk in resp.aiter_text():
+                            error_text += chunk
+                        logger.warning(f"<- upstream stream error {resp.status_code} (attempt {attempt+1}/{MAX_STREAM_RETRIES}): {error_text[:500]}")
 
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data_str = line[6:].strip()
-                    if data_str == "[DONE]":
-                        break
+                        if resp.status_code in STREAM_RETRY_STATUSES and attempt < MAX_STREAM_RETRIES - 1:
+                            await asyncio.sleep(1 * (attempt + 1))
+                            last_error = error_text
+                            continue
 
-                    try:
-                        chunk = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
+                        try:
+                            error_body = json.loads(error_text)
+                        except Exception:
+                            error_body = {"error": {"message": error_text, "type": "api_error"}}
+                        _, err = convert_error(resp.status_code, error_body)
+                        yield sse_event("error", err)
+                        return
 
-                    choices = chunk.get("choices", [])
-                    if not choices:
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:].strip()
+                        if data_str == "[DONE]":
+                            break
+
+                        try:
+                            chunk = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        # Debug: log every chunk that contains tool_calls
+                        choices_raw = chunk.get("choices", [])
+                        if choices_raw:
+                            d = choices_raw[0].get("delta", {})
+                            if d.get("tool_calls"):
+                                logger.info(f"<- RAW chunk delta: {json.dumps(d, ensure_ascii=False)[:800]}")
+
+                        choices = chunk.get("choices", [])
+                        if not choices:
+                            usage = chunk.get("usage")
+                            if usage:
+                                output_tokens = usage.get("completion_tokens", 0)
+                            continue
+
+                        choice = choices[0]
+                        delta = choice.get("delta", {})
+                        chunk_finish = choice.get("finish_reason")
+
+                        if chunk_finish:
+                            finish_reason = FINISH_REASON_MAP.get(chunk_finish, "end_turn")
+
                         usage = chunk.get("usage")
                         if usage:
                             output_tokens = usage.get("completion_tokens", 0)
-                        continue
 
-                    choice = choices[0]
-                    delta = choice.get("delta", {})
-                    chunk_finish = choice.get("finish_reason")
-
-                    if chunk_finish:
-                        finish_reason = FINISH_REASON_MAP.get(chunk_finish, "end_turn")
-
-                    usage = chunk.get("usage")
-                    if usage:
-                        output_tokens = usage.get("completion_tokens", 0)
-
-                    # Handle reasoning_content (thinking)
-                    reasoning = delta.get("reasoning_content")
-                    if reasoning:
-                        if current_block_type != "thinking":
-                            if current_block_type is not None:
-                                yield build_content_block_stop_event(block_index)
-                                block_index += 1
-                            yield build_content_block_start_event(block_index, "thinking")
-                            current_block_type = "thinking"
-                        yield build_content_block_delta_event(block_index, "thinking_delta", text=reasoning)
-                        continue
-
-                    # Handle text content
-                    text_content = delta.get("content")
-                    if text_content:
-                        if current_block_type != "text":
-                            if current_block_type is not None:
-                                yield build_content_block_stop_event(block_index)
-                                block_index += 1
-                            yield build_content_block_start_event(block_index, "text")
-                            current_block_type = "text"
-                        yield build_content_block_delta_event(block_index, "text_delta", text=text_content)
-                        continue
-
-                    # Handle tool calls
-                    tool_calls = delta.get("tool_calls")
-                    if tool_calls:
-                        for tc in tool_calls:
-                            tc_index = tc.get("index", 0)
-                            if tc_index not in tool_call_states:
+                        # Handle reasoning_content (thinking)
+                        reasoning = delta.get("reasoning_content")
+                        if reasoning:
+                            if current_block_type != "thinking":
                                 if current_block_type is not None:
                                     yield build_content_block_stop_event(block_index)
                                     block_index += 1
-                                tc_id = tc.get("id", f"toolu_{uuid.uuid4().hex[:12]}")
-                                tc_name = tc.get("function", {}).get("name", "")
-                                tool_call_states[tc_index] = {
-                                    "id": tc_id,
-                                    "name": tc_name,
-                                    "block_index": block_index,
-                                }
-                                yield build_content_block_start_event(
-                                    block_index, "tool_use", tool_id=tc_id, tool_name=tc_name
-                                )
-                                current_block_type = "tool_use"
+                                yield build_content_block_start_event(block_index, "thinking")
+                                current_block_type = "thinking"
+                            yield build_content_block_delta_event(block_index, "thinking_delta", text=reasoning)
+                            continue
 
-                            args_delta = tc.get("function", {}).get("arguments", "")
-                            if args_delta:
-                                bi = tool_call_states[tc_index]["block_index"]
-                                yield build_content_block_delta_event(
-                                    bi, "input_json_delta", partial_json=args_delta
-                                )
+                        # Handle text content
+                        text_content = delta.get("content")
+                        if text_content:
+                            if current_block_type != "text":
+                                if current_block_type is not None:
+                                    yield build_content_block_stop_event(block_index)
+                                    block_index += 1
+                                yield build_content_block_start_event(block_index, "text")
+                                current_block_type = "text"
+                            yield build_content_block_delta_event(block_index, "text_delta", text=text_content)
+                            continue
+
+                        # Handle tool calls
+                        tool_calls = delta.get("tool_calls")
+                        if tool_calls:
+                            logger.info(f"<- stream tool_calls delta: {json.dumps(tool_calls, ensure_ascii=False)[:500]}")
+                            for tc in tool_calls:
+                                tc_index = tc.get("index", 0)
+                                if tc_index not in tool_call_states:
+                                    if current_block_type is not None:
+                                        yield build_content_block_stop_event(block_index)
+                                        block_index += 1
+                                    tc_id = tc.get("id", f"toolu_{uuid.uuid4().hex[:12]}")
+                                    tc_name = tc.get("function", {}).get("name", "")
+                                    tool_call_states[tc_index] = {
+                                        "id": tc_id,
+                                        "name": tc_name,
+                                        "block_index": block_index,
+                                    }
+                                    yield build_content_block_start_event(
+                                        block_index, "tool_use", tool_id=tc_id, tool_name=tc_name
+                                    )
+                                    current_block_type = "tool_use"
+
+                                args_delta = tc.get("function", {}).get("arguments", "")
+                                if args_delta:
+                                    bi = tool_call_states[tc_index]["block_index"]
+                                    yield build_content_block_delta_event(
+                                        bi, "input_json_delta", partial_json=args_delta
+                                    )
+
+                    # Successfully streamed, break out of retry loop
+                    break
 
         # Close the last content block
         if current_block_type is not None:
@@ -578,22 +604,26 @@ async def handle_streaming(openai_req: dict, model: str):
 
 
 async def handle_non_streaming(openai_req: dict, model: str):
-    async with get_http_client() as client:
-        resp = await client.post(
-            "/v1/chat/completions", json=openai_req, headers=get_upstream_headers()
-        )
-        if resp.status_code != 200:
-            logger.warning(f"<- upstream {resp.status_code}: {resp.text[:500]}")
-            try:
-                error_body = resp.json()
-            except Exception:
-                error_body = {"error": {"message": resp.text, "type": "api_error"}}
-            status, body = convert_error(resp.status_code, error_body)
-            return JSONResponse(status_code=status, content=body)
-        openai_resp = resp.json()
-        anthropic_resp = convert_response(openai_resp, model=model)
-        logger.info(f"<- 200 model={model} stop={anthropic_resp.get('stop_reason')}")
-        return JSONResponse(content=anthropic_resp)
+    for attempt in range(MAX_STREAM_RETRIES):
+        async with get_http_client() as client:
+            resp = await client.post(
+                "/v1/chat/completions", json=openai_req, headers=get_upstream_headers()
+            )
+            if resp.status_code != 200:
+                logger.warning(f"<- upstream {resp.status_code} (attempt {attempt+1}/{MAX_STREAM_RETRIES}): {resp.text[:500]}")
+                if resp.status_code in STREAM_RETRY_STATUSES and attempt < MAX_STREAM_RETRIES - 1:
+                    await asyncio.sleep(1 * (attempt + 1))
+                    continue
+                try:
+                    error_body = resp.json()
+                except Exception:
+                    error_body = {"error": {"message": resp.text, "type": "api_error"}}
+                status, body = convert_error(resp.status_code, error_body)
+                return JSONResponse(status_code=status, content=body)
+            openai_resp = resp.json()
+            anthropic_resp = convert_response(openai_resp, model=model)
+            logger.info(f"<- 200 model={model} stop={anthropic_resp.get('stop_reason')}")
+            return JSONResponse(content=anthropic_resp)
 
 
 @app.post("/v1/messages")
@@ -604,6 +634,24 @@ async def messages_endpoint(request: Request):
     openai_req = convert_request(body)
 
     logger.info(f"-> model={model} stream={is_stream} messages={len(body.get('messages', []))}")
+
+    # Debug: log tools and converted request details
+    if "tools" in body:
+        logger.info(f"-> tools count: {len(body['tools'])}")
+    if "tools" in openai_req:
+        logger.info(f"-> converted tools count: {len(openai_req['tools'])}")
+        for t in openai_req["tools"][:3]:
+            logger.info(f"   tool: {t['function']['name']} params_keys={list(t['function'].get('parameters', {}).get('properties', {}).keys())[:5]}")
+
+    # Debug: log the last message to check tool_use input
+    if body.get("messages"):
+        last_msg = body["messages"][-1]
+        if isinstance(last_msg.get("content"), list):
+            for block in last_msg["content"]:
+                if block.get("type") == "tool_use":
+                    logger.info(f"-> tool_use in msg: name={block.get('name')} input_keys={list(block.get('input', {}).keys())}")
+                elif block.get("type") == "tool_result":
+                    logger.info(f"-> tool_result in msg: tool_use_id={block.get('tool_use_id')}")
 
     try:
         if is_stream:
