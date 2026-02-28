@@ -1,8 +1,0 @@
-server:
-  host: "0.0.0.0"
-  port: 18081
-
-upstream:
-  base_url: "https://your-relay.example.com"
-  api_key: "sk-xxx"
-  timeout: 300
