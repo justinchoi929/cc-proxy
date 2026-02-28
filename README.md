@@ -25,6 +25,8 @@ cc-proxy 伪装为 Anthropic Messages API 端点，接收 Claude Code 的请求�
 - 流式响应（SSE）
 - 非流式响应
 - 错误格式转换
+- 模型名称映射（通过 `model_map` 配置）
+- 请求自动重试（对 404/429/500/502/503/529 等瞬时错误最多重试 3 次）
 
 ## 快速开始
 
@@ -47,6 +49,10 @@ upstream:
   base_url: "https://your-relay.example.com"  # 中转站地址
   api_key: "sk-xxx"                            # 中转站 API Key
   timeout: 300                                 # 请求超时（秒）
+
+# 可选：模型名称映射
+model_map:
+  claude-sonnet-4-20250514: "your-model-name"
 ```
 
 ### 2. 启动
@@ -93,6 +99,23 @@ export ANTHROPIC_API_KEY=any-value
 | `upstream.base_url` | 中转站地址 | 无，必填 |
 | `upstream.api_key` | 中转站 API Key | 无，必填 |
 | `upstream.timeout` | 请求超时时间（秒） | `300` |
+| `model_map` | 模型名称映射表（可选） | `{}` |
+
+### 模型映射
+
+如果你的中转站使用不同的模型名称，可以通过 `model_map` 进行映射：
+
+```yaml
+model_map:
+  claude-sonnet-4-20250514: "gpt-4o"
+  claude-haiku-3-5-20241022: "gpt-4o-mini"
+```
+
+代理会自动将 Claude Code 发出的模型名称替换为映射后的名称，未配置映射的模型名称将原样透传。
+
+### 自动重试
+
+代理对上游中转站的瞬时错误（HTTP 404/429/500/502/503/529）自动重试，最多 3 次，退避间隔递增（1s、2s、3s）。流式和非流式请求均支持。
 
 ## 运行测试
 
